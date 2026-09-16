@@ -80,7 +80,7 @@ param enableAzureSpotPricing bool = false
 ])
 param zones string = '1'
 
-var templateBaseUrl = 'https://raw.githubusercontent.com/${githubAccount}/microhack/${githubBranch}/03-Azure/01-03-Infrastructure/06_Migration_Secure_AI_Ready/resources/'
+var templateBaseUrl = 'https://raw.githubusercontent.com/${githubAccount}/MicroHack/${githubBranch}/03-Azure/01-03-Infrastructure/06_Migration_Secure_AI_Ready/resources/'
 
 var userName = contains(deployer().userPrincipalName, '@') ? substring(deployer().userPrincipalName, 0, indexOf(deployer().userPrincipalName, '@')) : deployer().userPrincipalName
 
@@ -92,14 +92,14 @@ var resourceTags object = {
   User: userName
 }
 
-@description('Source Resouce Group')
+@description('Source resource group')
 resource sourceRg 'Microsoft.Resources/resourceGroups@2021-01-01'={
   name: '${namingPrefix}-source-rg'
   location: location
   tags: resourceTags
 }
 
-@description('Destination Resouce Group')
+@description('Destination resource group')
 resource destinationRg 'Microsoft.Resources/resourceGroups@2021-01-01'={
   name: '${namingPrefix}-destination-rg'
   location: location
