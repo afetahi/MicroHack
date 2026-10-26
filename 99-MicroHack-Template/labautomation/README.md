@@ -11,6 +11,9 @@ optional script, [shared-deploy-lab.ps1](shared-deploy-lab.ps1), runs once per
 subscription *ahead of* that fan-out to lay down whatever the individual labs
 build on. See
 [Optional hook](#optional-hook-shared-deploy-labps1).
+For resources shared across *all* subscriptions in an event, use the opt-in
+[global event hook](#optional-hook-global-event-deployps1), which runs before the
+per-subscription shared hooks.
 
 **One deployment fans out into N identical labs, one per participant.** The
 platform runs *your one script* many times over, in a separate process each
@@ -27,7 +30,10 @@ flowchart TD
     A[Deployment start] --> B[Read lab-defaults.json]
     B --> C["Reserve the event's subscriptions"]
     C --> D["Pre-provision each participant's scope<br/>subscription / resource group<br/>+ user RBAC"]
-    D --> SH["shared-deploy-lab.ps1 (optional)<br/>once per subscription, in parallel<br/>receives all its participants"]
+    D --> GE["global-event-deploy.ps1 (opt-in)<br/>once per event in lowest-GUID subscription<br/>receives all event participants"]
+    GE --> GG{"Global stage<br/>succeeded or not enabled?"}
+    GG -- no --> X
+    GG -- yes --> SH["shared-deploy-lab.ps1 (optional)<br/>once per subscription, in parallel<br/>receives all its participants"]
     SH --> G{"Shared stage<br/>succeeded?"}
     G -- no --> X["No deploy-lab.ps1 runs at all<br/>deployment marked failed"]
 
@@ -43,6 +49,7 @@ flowchart TD
     G -- yes --> LN
 
     SH -. HackboxCredential for every lab in that subscription .-> CR
+    GE -. HackboxCredential for every lab in the event .-> CR
     L1 -. HackboxCredential .-> CR
     L2 -. HackboxCredential .-> CR
     LN -. HackboxCredential .-> CR
@@ -94,6 +101,7 @@ Key points for integration:
       - [Passwords and re-runs](#passwords-and-re-runs)
     - [Cleaning up](#cleaning-up)
     - [Local testing](#local-testing)
+  - [Optional hook: `global-event-deploy.ps1`](#optional-hook-global-event-deployps1)
   - [Optional hook: `shared-deploy-lab.ps1`](#optional-hook-shared-deploy-labps1)
     - [Where it fits in the pipeline](#where-it-fits-in-the-pipeline)
     - [Shared hook parameter contract](#shared-hook-parameter-contract)
@@ -101,6 +109,8 @@ Key points for integration:
     - [Example: a shared hub network](#example-a-shared-hub-network)
     - [Testing the shared hook locally](#testing-the-shared-hook-locally)
   - [Available helper cmdlets](#available-helper-cmdlets)
+    - [`Get-MhhGroupName`](#get-mhhgroupname)
+    - [`Get-MhhDefaultLabGroup`](#get-mhhdefaultlabgroup)
     - [`New-MhhStablePassword`](#new-mhhstablepassword)
     - [`Get-MhhStableHash`](#get-mhhstablehash)
     - [`Get-MhhLabUser`](#get-mhhlabuser)
@@ -119,6 +129,7 @@ Key points for integration:
 ```text
 labautomation/
 ├── lab-defaults.json        # Platform-facing configuration (required if folder exists)
+├── global-event-deploy.ps1  # Opt-in: once per event, before the shared hooks
 ├── shared-deploy-lab.ps1    # Optional: runs once per subscription, before the labs
 ├── deploy-lab.ps1           # Optional: per-user Azure deployment script
 ├── main.bicep               # Optional: Bicep/ARM template your script deploys  (Recommended)
@@ -129,6 +140,8 @@ labautomation/
 automatically by file name, no registration step is required. Anything else in
 the folder is yours; reference it from your script with
 `Join-Path $PSScriptRoot '<name>'`.
+The global event hook additionally requires the cost opt-in described below;
+re-import the content pack after adding or enabling it.
 
 ## `lab-defaults.json`
 
@@ -161,6 +174,7 @@ Only include fields you want to set; missing fields fall back to platform defaul
 | `preferredLocation` | `string` | Comma-separated Azure regions, **in priority order** (e.g. `"swedencentral, norwayeast"`). The first region is used as the default deployment location. List multiple regions so your script can fall back if the first region doesn't support every service your lab needs; see [authoring guidelines](#authoring-guidelines). |
 | `estimatedDailyCostsUsd` | `number` (≥ 0) | Estimated daily cost per lab environment in USD. Based on the resources created by `deploy-lab.ps1`. Used for cost forecasting in the lab lifecycle wizard. |
 | `estimatedSharedDeploymentDailyCostsUsd` | `number` (≥ 0) | Estimated daily cost in USD of resources created once per subscription by `shared-deploy-lab.ps1`. Cost forecasting multiplies this value by the subscription count: labs divided by `labsPerSubscription`, rounded up, for resource-group deployments; one subscription per lab for `subscription` deployments. Defaults to `0` when absent. |
+| `estimatedGlobalDeploymentDailyCostsUsd` | `number` (≥ 0) | Estimated daily cost in USD of resources created once per event by `global-event-deploy.ps1`, not multiplied by subscription count. Must be **greater than 5**, with a matching hook signature, to enable global deployment. |
 
 ### Cost forecasting formula
 
@@ -183,6 +197,7 @@ The final estimated cost in USD is:
 \underbrace{\left(\text{estimatedDailyCostsUsd} + \textstyle\sum \text{groupSurcharge}\right)}_{\text{per-lab}}
 + \text{subs} \times
 \underbrace{\text{estimatedSharedDeploymentDailyCostsUsd}}_{\text{per-subscription}}
++ \underbrace{\text{estimatedGlobalDeploymentDailyCostsUsd}}_{\text{per-event, when enabled}}
 \right)
 ```
 
@@ -190,6 +205,7 @@ Here, `labs` is the number of lab environments, `days` is the deployment duratio
 and $\sum \text{groupSurcharge}$ represents the license costs for `groups` per lab.
 Per-lab costs and group surcharges are multiplied by `labs`; shared deployment costs are multiplied by `subs`
 because `shared-deploy-lab.ps1` runs once per subscription.
+Enabled global deployment costs are added once per day for the whole event.
 
 ### `groups`: supported values
 
@@ -631,6 +647,34 @@ required parameters from the [contract](#required-parameter-contract):
 > They are not identical to the platform versions, but they are sufficient for
 > testing your script logic and parameter contract.
 
+## Optional hook: `global-event-deploy.ps1`
+
+Place this file beside `deploy-lab.ps1` in the content pack's lab folder using
+exactly this parameter contract:
+
+```powershell
+param(
+    [Parameter(Mandatory=$true)] [string]$SubscriptionId,
+    [Parameter(Mandatory=$true)] [string[]]$PreferredLocation = @(),
+    [Parameter(Mandatory=$false)] [string[]]$AllowedEntraUserIds = @()
+)
+```
+
+Set `estimatedGlobalDeploymentDailyCostsUsd` in `lab-defaults.json` to a value
+**greater than 5**, then **re-import the content pack**. If the signature does not
+match or the cost is 5 or less, the Console skips the hook and logs a warning.
+
+The Console runs it **once per event**, in the event's **lowest-GUID
+subscription**, with **all event lab-user object IDs**. It must finish before
+any `shared-deploy-lab.ps1` invocation. Failure stops the entire lab deployment.
+The hook does not pick a different subscription based on regional quota.
+
+Every `HackboxCredential` it outputs is delivered to **every lab user in the
+event**. Publish nonsecret resource IDs for discovery across subscriptions; do not
+publish organizer-only credentials. Grant the needed shared-resource permissions
+to all intended users, preserve safe reruns, and remove the same resource creation
+from the per-subscription hook to avoid deploying duplicate infrastructure.
+
 ## Optional hook: `shared-deploy-lab.ps1`
 
 `deploy-lab.ps1` deliberately only ever sees one lab. That is what makes it safe
@@ -789,8 +833,11 @@ as in [Local testing](#local-testing); only the invocation differs:
 
 Pass `-PreferredLocation` as a comma-separated string or as an array, matching
 however you declared it. Run the scripts in the real order —
-`shared-deploy-lab.ps1` first, then `deploy-lab.ps1` — if you want to reproduce
-what the platform does. Pass more than one object ID to `-AllowedEntraUserIds`
+`global-event-deploy.ps1` once when enabled, then `shared-deploy-lab.ps1` per
+subscription, then `deploy-lab.ps1` per lab — if you want to reproduce
+what the platform does. Use the global host context and all event users for the
+global hook; use each subscription's context and users for its shared hook.
+Pass more than one object ID to `-AllowedEntraUserIds`
 to check that your RBAC really covers every participant.
 
 ## Available helper cmdlets
@@ -799,6 +846,60 @@ The platform ships a PowerShell module that is auto-imported into your script
 (and into any `Start-Job` child runspaces you spawn). No `Import-Module` call
 is required. Every cmdlet has full comment-based help:
 `Get-Help Invoke-MhhTofuCommand -Full`.
+
+### `Get-MhhGroupName`
+
+Derive stable management-group names for a MicroHack event. The group name
+contains the full SHA-256 digest of the event ID encoded as lowercase Base36;
+the display name is sanitised and may be truncated.
+
+```powershell
+$names = Get-MhhGroupName -EventId 'BCDR 2026'
+Write-Host "Group name: $($names.GroupName)"
+Write-Host "Display name: $($names.DisplayName)"
+```
+
+| Parameter | Description |
+| --- | --- |
+| `EventId` (`string`) | Unique identifier for the MicroHack event. When omitted or empty, defaults to `MHH_EVENTID`. The cmdlet throws if neither source provides a non-empty value. |
+
+**Return value:** one `PSCustomObject`:
+
+| Field | Description |
+| --- | --- |
+| `GroupName` | Stable management-group name containing the event ID's full SHA-256 digest encoded as lowercase Base36. |
+| `DisplayName` | Sanitised, potentially truncated display name for the event. |
+
+Use `GroupName` for identity and lookups. Unlike `DisplayName`, it retains the
+full event hash and therefore does not become ambiguous when two sanitised names
+truncate to the same value.
+
+### `Get-MhhDefaultLabGroup`
+
+Resolve this event's Entra security group. The cmdlet takes no arguments: it
+calls [`Get-MhhGroupName`](#get-mhhgroupname).
+It throws if the group does not exist and never creates one.
+
+```powershell
+$group = Get-MhhDefaultLabGroup
+Write-Host "ObjectId: $($group.ObjectId)"
+Write-Host "GroupName: $($group.GroupName)"
+Write-Host "DisplayName: $($group.DisplayName)"
+```
+
+**Parameters:** none.
+
+**Return value:** one `PSCustomObject`:
+
+| Field | Description |
+| --- | --- |
+| `ObjectId` | Entra object ID of the resolved security group. |
+| `GroupName` | Stable group name derived from `MHH_EVENTID`. |
+| `DisplayName` | Display name of the resolved group. |
+
+The lookup uses `mailNickname`, not display name. `mailNickname` contains the
+full event hash, while the sanitised and truncated display name can repeat
+across distinct events.
 
 ### `New-MhhStablePassword`
 
@@ -1447,5 +1548,3 @@ resource names unique inside the subscription.
 - **Do not call `Connect-AzAccount`, `Set-AzContext` or `az login`.** The platform
   manages authentication and subscription context, and keeps each lab's Azure
   CLI login isolated for you.
-
-
